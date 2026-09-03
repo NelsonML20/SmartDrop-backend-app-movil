@@ -8,15 +8,14 @@ from .permissions import EsUsuarioAutenticado
 from smartdrop.supabase_client import supabase_get, supabase_post
 from .vivienda_utils import resolver_vivienda_activa as _resolver_vivienda_activa
 from .views_vivienda import supabase_get as _sg  
-from .consumo_utils import calcular_consumo_rango, obtener_consumo_dia, serie_por_dia, serie_por_hora_hoy
+from .consumo_utils import calcular_consumo_rango, obtener_consumo_dia, serie_por_dia, serie_por_hora_hoy, total_consumo_dias, resolver_sensor, _calcular_dias_cerrados_batch
 
 
-
-
-
-def _estado_consumo(porcentaje_cambio):
+def _estado_consumo(consumo_total, porcentaje_cambio):
+    if consumo_total <= 0:
+        return "SIN ACTIVIDAD REGISTRADA", "gris"
     if porcentaje_cambio is None:
-        return "CONSUMO NORMAL", "verde"
+        return "CONSUMO REGISTRADO", "gris"
     if porcentaje_cambio > 25:
         return "CONSUMO ELEVADO", "rojo"
     if porcentaje_cambio > 10:
@@ -27,7 +26,6 @@ def _estado_consumo(porcentaje_cambio):
 
 
 class ConsumoView(APIView):
-    """GET /auth/consumo/?periodo=dia|semana|mes — Escenarios 1, 3, 4"""
     authentication_classes = [SupabaseJWTAuthentication]
     permission_classes     = [EsUsuarioAutenticado]
 
@@ -53,18 +51,21 @@ class ConsumoView(APIView):
             serie = serie_por_dia(id_vivienda, 7)
             consumo_total = round(sum(p["litros"] for p in serie), 2)
             inicio_pasada = hoy - timedelta(days=13)
-            consumo_anterior = sum(obtener_consumo_dia(id_vivienda, inicio_pasada + timedelta(days=i)) for i in range(7))
+            dias_semana_pasada = [inicio_pasada + timedelta(days=i) for i in range(7)]
+            consumo_anterior = total_consumo_dias(id_vivienda, dias_semana_pasada)
             etiqueta = "semana pasada"
 
         else:
             serie = serie_por_dia(id_vivienda, 30)
             consumo_total = round(sum(p["litros"] for p in serie), 2)
             inicio_pasado = hoy - timedelta(days=59)
-            consumo_anterior = sum(obtener_consumo_dia(id_vivienda, inicio_pasado + timedelta(days=i)) for i in range(30))
+            dias_mes_pasado = [inicio_pasado + timedelta(days=i) for i in range(30)]
+            consumo_anterior = total_consumo_dias(id_vivienda, dias_mes_pasado)
             etiqueta = "mes pasado"
 
         porcentaje = round(((consumo_total - consumo_anterior) / consumo_anterior) * 100, 1) if consumo_anterior else None
-        estado_texto, color = _estado_consumo(porcentaje)
+        estado_texto, color = _estado_consumo(consumo_total, porcentaje)
+
         texto_comparacion = (
             f"{'+' if porcentaje >= 0 else ''}{porcentaje}% vs. {etiqueta}"
             if porcentaje is not None else "Sin datos suficientes para comparar todavía."
@@ -97,7 +98,9 @@ class RetroalimentacionView(APIView):
         hoy = datetime.utcnow().date()
         consumo_hoy = calcular_consumo_rango(id_vivienda, datetime.combine(hoy, datetime.min.time()), datetime.utcnow())
 
-        dias_previos = [obtener_consumo_dia(id_vivienda, hoy - timedelta(days=i)) for i in range(1, 8)]
+        fechas_previas = [hoy - timedelta(days=i) for i in range(1, 8)]
+        valores_previos = _calcular_dias_cerrados_batch(id_vivienda, fechas_previas)
+        dias_previos = [valores_previos[f.isoformat()] for f in fechas_previas]
         dias_validos = [d for d in dias_previos if d and d > 0]
         promedio_habitual = round(sum(dias_validos) / len(dias_validos), 2) if dias_validos else None
 
@@ -122,7 +125,15 @@ class RetroalimentacionView(APIView):
         # Comparación 
         inicio_mes = hoy.replace(day=1)
         dias_transcurridos = (hoy - inicio_mes).days + 1
-        consumo_mes_actual = sum(obtener_consumo_dia(id_vivienda, inicio_mes + timedelta(days=i)) for i in range(dias_transcurridos))
+
+        fechas_mes_actual_cerradas = [inicio_mes + timedelta(days=i) for i in range(dias_transcurridos - 1)]
+        consumo_mes_actual = total_consumo_dias(id_vivienda, fechas_mes_actual_cerradas) + calcular_consumo_rango(
+            id_vivienda, datetime.combine(hoy, datetime.min.time()), datetime.utcnow()
+        )
+
+        primer_dia_mes_pasado = (inicio_mes - timedelta(days=1)).replace(day=1)
+        fechas_mes_pasado = [primer_dia_mes_pasado + timedelta(days=i) for i in range(dias_transcurridos)]
+        consumo_mes_pasado = total_consumo_dias(id_vivienda, fechas_mes_pasado)
 
         primer_dia_mes_pasado = (inicio_mes - timedelta(days=1)).replace(day=1)
         consumo_mes_pasado = sum(obtener_consumo_dia(id_vivienda, primer_dia_mes_pasado + timedelta(days=i)) for i in range(dias_transcurridos))

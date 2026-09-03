@@ -1,4 +1,3 @@
-# usuarios/consumo_utils.py
 """
 Motor de cálculo de consumo. Integra caudal (L/min) → litros.
 Optimizado para evitar el patrón N+1: siempre trae el rango completo
@@ -36,6 +35,59 @@ def _agrupar_lecturas_por_dia(lecturas):
         grupos.setdefault(dia, []).append(l)
     return grupos
 
+def _calcular_dias_cerrados_batch(id_vivienda, dias_lista, sensor=None):
+    if not dias_lista:
+        return {}
+
+    sensor = sensor or resolver_sensor("flujo")
+    if not sensor:
+        return {d.isoformat(): 0.0 for d in dias_lista}
+
+    minimo, maximo = min(dias_lista), max(dias_lista)
+
+    cache_rows = supabase_get(
+        "consumo",
+        f"id_vivienda=eq.{id_vivienda}&periodo=eq.dia"
+        f"&fecha=gte.{minimo.isoformat()}T00:00:00&fecha=lte.{maximo.isoformat()}T23:59:59"
+        f"&select=fecha,consumo_total"
+    )
+    resultado = {row["fecha"][:10]: (row["consumo_total"] or 0.0) for row in cache_rows}
+
+    faltantes = [d for d in dias_lista if d.isoformat() not in resultado]
+
+    if faltantes:
+        desde_dt = datetime.combine(min(faltantes), datetime.min.time())
+        hasta_dt = datetime.combine(max(faltantes), datetime.max.time())
+        lecturas = supabase_get(
+            "lectura",
+            f"id_sensor=eq.{sensor['id_sensor']}&id_vivienda=eq.{id_vivienda}"
+            f"&fecha_registro=gte.{_iso(desde_dt)}&fecha_registro=lte.{_iso(hasta_dt)}"
+            f"&order=fecha_registro.asc&select=valor,fecha_registro"
+        )
+        lecturas_por_dia = _agrupar_lecturas_por_dia(lecturas)
+
+        filas_nuevas = []
+        for dia in faltantes:
+            valor = _integrar_lecturas(lecturas_por_dia.get(dia.isoformat(), []))
+            resultado[dia.isoformat()] = valor
+            filas_nuevas.append({
+                "id_vivienda": id_vivienda, "fecha": _iso(datetime.combine(dia, datetime.min.time())),
+                "consumo_total": valor, "consumo_promedio": valor, "consumo_maximo": valor,
+                "consumo_minimo": valor, "periodo": "dia", "estado_pago": "pendiente",
+            })
+
+        if filas_nuevas:
+            supabase_post("consumo", filas_nuevas) 
+
+    for d in dias_lista:
+        resultado.setdefault(d.isoformat(), 0.0)
+    return resultado
+
+
+def total_consumo_dias(id_vivienda, dias_lista, sensor=None):
+    """Suma el consumo de una lista de días específicos (todos cerrados)."""
+    return round(sum(_calcular_dias_cerrados_batch(id_vivienda, dias_lista, sensor=sensor).values()), 2)
+
 
 def calcular_consumo_rango(id_vivienda, desde, hasta, sensor=None):
     sensor = sensor or resolver_sensor("flujo")
@@ -51,71 +103,24 @@ def calcular_consumo_rango(id_vivienda, desde, hasta, sensor=None):
 
 
 def serie_por_dia(id_vivienda, dias):
-    """
-    Antes: hasta `dias` × 3 peticiones (una por cada día).
-    Ahora: máximo 2-3 peticiones totales, sin importar cuántos días sean.
-    """
     sensor = resolver_sensor("flujo")
     if not sensor:
         return []
 
     hoy = datetime.utcnow().date()
     inicio_rango = hoy - timedelta(days=dias - 1)
+    dias_cerrados = [inicio_rango + timedelta(days=i) for i in range(dias) if (inicio_rango + timedelta(days=i)) < hoy]
 
-    # 1 sola petición: trae TODO el caché existente del rango de una vez
-    cache_rows = supabase_get(
-        "consumo",
-        f"id_vivienda=eq.{id_vivienda}&periodo=eq.dia"
-        f"&fecha=gte.{inicio_rango.isoformat()}T00:00:00&fecha=lte.{hoy.isoformat()}T23:59:59"
-        f"&select=fecha,consumo_total"
-    )
-    cache_por_dia = {row["fecha"][:10]: row["consumo_total"] for row in cache_rows}
+    valores = _calcular_dias_cerrados_batch(id_vivienda, dias_cerrados, sensor=sensor)
 
-    # Determina qué días CERRADOS faltan en caché (hoy nunca se cachea)
-    dias_faltantes = [
-        inicio_rango + timedelta(days=i) for i in range(dias)
-        if (inicio_rango + timedelta(days=i)) < hoy
-        and (inicio_rango + timedelta(days=i)).isoformat() not in cache_por_dia
-    ]
-
-    lecturas_por_dia = {}
-    if dias_faltantes:
-        # 1 sola petición: trae TODAS las lecturas necesarias de una vez
-        desde_dt = datetime.combine(min(dias_faltantes), datetime.min.time())
-        hasta_dt = datetime.combine(max(dias_faltantes), datetime.max.time())
-        lecturas = supabase_get(
-            "lectura",
-            f"id_sensor=eq.{sensor['id_sensor']}&id_vivienda=eq.{id_vivienda}"
-            f"&fecha_registro=gte.{_iso(desde_dt)}&fecha_registro=lte.{_iso(hasta_dt)}"
-            f"&order=fecha_registro.asc&select=valor,fecha_registro"
-        )
-        lecturas_por_dia = _agrupar_lecturas_por_dia(lecturas)
-
-        # Calcula y cachea en memoria (esto SÍ hace 1 POST por día faltante,
-        # pero solo ocurre la primera vez que se pide ese día; luego siempre lee caché)
-        for dia in dias_faltantes:
-            valor = _integrar_lecturas(lecturas_por_dia.get(dia.isoformat(), []))
-            cache_por_dia[dia.isoformat()] = valor
-            supabase_post("consumo", {
-                "id_vivienda": id_vivienda,
-                "fecha": _iso(datetime.combine(dia, datetime.min.time())),
-                "consumo_total": valor,
-                "consumo_promedio": valor,
-                "consumo_maximo": valor,
-                "consumo_minimo": valor,
-                "periodo": "dia",
-                "estado_pago": "pendiente",
-            })
-
-    # Día de hoy: siempre en vivo (1 petición más, solo si "hoy" está en el rango)
     if hoy >= inicio_rango:
-        cache_por_dia[hoy.isoformat()] = calcular_consumo_rango(
+        valores[hoy.isoformat()] = calcular_consumo_rango(
             id_vivienda, datetime.combine(hoy, datetime.min.time()), datetime.utcnow(), sensor=sensor
         )
 
     return [
         {"fecha": (inicio_rango + timedelta(days=i)).isoformat(),
-         "litros": cache_por_dia.get((inicio_rango + timedelta(days=i)).isoformat(), 0.0)}
+         "litros": valores.get((inicio_rango + timedelta(days=i)).isoformat(), 0.0)}
         for i in range(dias)
     ]
 
